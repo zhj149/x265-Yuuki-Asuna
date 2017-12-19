@@ -98,8 +98,17 @@ bool LavfInput::readPicture(x265_picture& p_pic, InputFileInfo* info)
 
     int finished = 0;
     int ret = 0;
+    int codec_ret = 0;
+    int fail = 0;
     do
     {
+        codec_ret = avcodec_receive_frame(h->cocon, h->frame);
+        // We are good, just leave the loop with our new frame
+        if(codec_ret == 0)
+        {
+            finished = 1;
+            break;
+        }
         ret = av_read_frame(h->lavf, &pkt);
 
         if(ret < 0)
@@ -109,18 +118,45 @@ bool LavfInput::readPicture(x265_picture& p_pic, InputFileInfo* info)
             pkt.size = 0;
         }
 
+        // We got a new valid packet, or EOF, let's feed it
         if(ret < 0 || pkt.stream_index == h->stream_id)
         {
-            if(avcodec_decode_video2(h->cocon, h->frame, &finished, &pkt) < 0)
-                general_log(NULL, "lavf", X265_LOG_WARNING, "video decoding failed on frame %d\n", h->next_frame);
+            // avcodec_decode_video2 deprecated
+            // avcodec_decode_video2(h->cocon, h->frame, &finished, &pkt)
+            // Use the following
+            codec_ret = avcodec_send_packet(h->cocon, &pkt);
+            // AVERROR(EAGAIN): not possible
+            // AVERROR(EINVAL): fvcked up
+            // AVERROR_EOF && pkt.data = NULL: continue
+            // 0: continue
+            if(codec_ret == AVERROR(EINVAL))
+            {
+                general_log(NULL, "lavf", X265_LOG_WARNING, "feeding input to decoder failed on frame %d\n", h->next_frame);
+                fail = 1;
+            }
+            else
+            {
+                codec_ret = avcodec_receive_frame(h->cocon, h->frame);
+                // AVERROR(EAGAIN): not finished, retry
+                // AVERROR(EINVAL): fvcked up
+                // AVERROR_EOF: not possible unless stream.nb_frames > actual frames
+                // 0: leave the loop
+                if(codec_ret == AVERROR(EINVAL))
+                {
+                    general_log(NULL, "lavf", X265_LOG_WARNING, "video decoding failed on frame %d\n", h->next_frame);
+                    fail = 1;
+                }
+                else if(codec_ret == 0)
+                    finished = 1;
+            }
         }
 
         if(ret >= 0)
             av_packet_unref(&pkt);
     }
-    while(!finished && ret >= 0);
+    while(!finished && !fail && ret >= 0);
 
-    if(!finished)
+    if(!finished || fail)
         return false;
 
     h->next_frame++;
@@ -289,7 +325,7 @@ void LavfInput::release()
     // avcodec_close(h->lavf->streams[h->stream_id]->codec);
     // 
     // Use the following
-    avcodec_free_context(h->cocon);
+    avcodec_free_context(&h->cocon);
     avformat_close_input(&h->lavf);
     av_frame_free(&h->frame);
 }
